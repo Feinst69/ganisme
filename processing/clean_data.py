@@ -2,30 +2,53 @@ import os
 from PIL import Image
 from torchvision import transforms
 import torch
+from tqdm import tqdm
 
+# === Configuration ===
+SOURCE_DIR = "./data/processed"
+FINAL_DIR = "./data/final"
+IMAGE_SIZE = 128
 
-source_dir = "./data/processed"
-final_dir = "./data/final"
-os.makedirs(final_dir, exist_ok=True)
+os.makedirs(FINAL_DIR, exist_ok=True)
 
-
-image_size = 64
+# === Transformation des images ===
 transform = transforms.Compose([
-    transforms.Resize(image_size),
-    transforms.CenterCrop(image_size),
+    transforms.Resize(IMAGE_SIZE),
+    transforms.CenterCrop(IMAGE_SIZE),
     transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-for filename in os.listdir(source_dir):
-    if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-        src_path = os.path.join(source_dir, filename)
-        dest_path = os.path.join(final_dir, filename)
+# === Traitement des images ===
+corrupted_files = []
 
+print("🔄 Démarrage du traitement des images...\n")
+
+for filename in tqdm(os.listdir(SOURCE_DIR), desc="Traitement des fichiers"):
+    # Vérifie l’extension du fichier
+    if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+        continue
+
+    src_path = os.path.join(SOURCE_DIR, filename)
+    dest_path = os.path.join(FINAL_DIR, filename)
+    dest_path_pt = os.path.splitext(dest_path)[0] + ".pt"
+
+    try:
         with Image.open(src_path) as img:
-            img = img.convert("RGB") 
-            tensor_img = transform(img) 
+            img = img.convert("RGB")
+            tensor_img = transform(img)
+            torch.save(tensor_img, dest_path_pt)
 
-           
-            torch.save(tensor_img, dest_path.replace(".jpg", ".pt").replace(".png", ".pt"))
-        print(f"Image traitée et sauvegardée : {dest_path}")
+    except Exception as e:
+        corrupted_files.append(filename)
+        continue  # Ignore les fichiers corrompus
+
+# === Sauvegarde de la liste des fichiers corrompus ===
+if corrupted_files:
+    corrupted_txt = os.path.join(FINAL_DIR, "corrupted_files.txt")
+    with open(corrupted_txt, "w") as f:
+        f.write("\n".join(corrupted_files))
+    print(f"\n⚠️ {len(corrupted_files)} fichiers corrompus ignorés.")
+    print(f"📄 Liste sauvegardée dans : {corrupted_txt}")
+else:
+    print("\n✅ Aucun fichier corrompu détecté.")
