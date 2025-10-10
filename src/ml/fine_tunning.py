@@ -1,5 +1,5 @@
-# fine_tune_continue_dynamic_fid_adjust.py
-import os, time, csv, pandas as pd
+# fine_tune_continue_dynamic_fid_adjust_v3.py
+import os, time, csv, shutil, pandas as pd
 from tqdm import tqdm
 import numpy as np
 
@@ -24,7 +24,7 @@ df = pd.read_csv(REPORT_CSV)
 best_row = df.loc[df["version"] == "v20"].iloc[0]
 
 # -----------------------
-# CONFIG initiale (params v20 pour latent_dim et batch_size)
+# CONFIG initiale
 # -----------------------
 CONFIG = {
     "version": "v20_dynamic_gpu_safe",
@@ -44,24 +44,29 @@ print(f"🚀 Device: {device}")
 # Modèle et CSV metrics
 # -----------------------
 MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), f"../data/model/{CONFIG['version']}"))
-METRICS_CSV = os.path.join(MODEL_DIR, "metrics_dynamic_gpu_safe_v2.csv")
 
-# -----------------------
-# Charger paramètres dynamiques depuis epoch 100
-# -----------------------
-if os.path.exists(METRICS_CSV):
-    df_metrics = pd.read_csv(METRICS_CSV)
-    if 100 in df_metrics["epoch"].values:
-        last_epoch_data = df_metrics[df_metrics["epoch"] == 100].iloc[0]
-        CONFIG["lr_G"] = float(last_epoch_data["lr_G"])
-        CONFIG["lr_D"] = float(last_epoch_data["lr_D"])
-        CONFIG["label_smooth"] = float(last_epoch_data.get("label_smooth", 0.9))
-        CONFIG["n_critic"] = int(last_epoch_data["n_critic_current"])
-        CONFIG["g_steps"] = int(last_epoch_data["g_steps_current"])
-    else:
-        raise ValueError("❌ Epoch 100 non trouvé dans le CSV metrics")
+# Copier metrics v2 vers v3
+OLD_CSV = os.path.join(MODEL_DIR, "metrics_dynamic_gpu_safe_v2.csv")
+NEW_CSV = os.path.join(MODEL_DIR, "metrics_dynamic_gpu_safe_v3.csv")
+if os.path.exists(OLD_CSV):
+    shutil.copy2(OLD_CSV, NEW_CSV)
+    print(f"✅ Copié {OLD_CSV} vers {NEW_CSV}")
 else:
-    raise FileNotFoundError(f"❌ CSV metrics introuvable : {METRICS_CSV}")
+    raise FileNotFoundError(f"❌ Fichier introuvable : {OLD_CSV}")
+
+METRICS_CSV = NEW_CSV
+
+# Charger paramètres dynamiques depuis epoch 100
+df_metrics = pd.read_csv(METRICS_CSV)
+if 100 in df_metrics["epoch"].values:
+    last_epoch_data = df_metrics[df_metrics["epoch"] == 100].iloc[0]
+    CONFIG["lr_G"] = float(last_epoch_data["lr_G"])
+    CONFIG["lr_D"] = float(last_epoch_data["lr_D"])
+    CONFIG["label_smooth"] = float(last_epoch_data.get("label_smooth", 0.9))
+    CONFIG["n_critic"] = int(last_epoch_data["n_critic_current"])
+    CONFIG["g_steps"] = int(last_epoch_data["g_steps_current"])
+else:
+    raise ValueError("❌ Epoch 100 non trouvé dans le CSV metrics")
 
 print("✅ Configuration finale pour continuation :")
 for k, v in CONFIG.items():
@@ -125,7 +130,7 @@ fid_metric = FrechetInceptionDistance(feature=2048).to(device)
 imagenet_mean = torch.tensor([0.485,0.456,0.406], device=device).view(1,3,1,1)
 imagenet_std  = torch.tensor([0.229,0.224,0.225], device=device).view(1,3,1,1)
 
-@torch.no_grad()
+@torch.no_grad
 def compute_inception_score(gen_imgs):
     imgs = F.interpolate(gen_imgs, size=(299,299), mode='bilinear', align_corners=False)
     imgs = (imgs.clamp(-1,1)+1)/2.0
@@ -141,12 +146,10 @@ def compute_inception_score(gen_imgs):
 # -----------------------
 n_critic_current = CONFIG["n_critic"]
 g_steps_current = CONFIG["g_steps"]
-fid_history, fakecorr_history = [], []
 max_lr, min_lr = 5e-4, 1e-6
-lr_factor = 1.05
-patience = 3
-no_change_epochs = 0
-prev_fid = None  # pour comparer epoch n+1 vs n
+prev_fid = None
+fake_threshold = 0.85  # seuil minimal pour fake_correct
+IS_prev = None
 
 # -----------------------
 # Déterminer l’epoch de départ
@@ -167,7 +170,6 @@ for epoch in range(start_epoch, start_epoch + CONFIG["num_extra_epochs"]):
 
         loss_D_total=0; loss_G_total=0
         fake_corrects = []
-        fid_metric.reset()
 
         for imgs,_ in tqdm(loader, desc=f"{phase} epoch {epoch+1}", leave=False):
             B = imgs.size(0)
@@ -219,18 +221,20 @@ for epoch in range(start_epoch, start_epoch + CONFIG["num_extra_epochs"]):
             fid_value = fid_metric.compute().item()
             IS_value = compute_inception_score(fake_imgs)
 
-        # ---- Ajustement dynamique si FID augmente
-        if prev_fid is not None and fid_value > prev_fid:
-            # FID augmente => réduire lr_G et lr_D légèrement et augmenter n_critic
+        # ---- Ajustement dynamique si FID, IS ou fake_correct déclenche
+        adjust = False
+        if prev_fid is not None and (fid_value > prev_fid or fake_correct < fake_threshold or (IS_prev is not None and IS_value < IS_prev)):
+            adjust = True
             for g in optimizer_G.param_groups:
                 g['lr'] = max(min_lr, g['lr'] / 1.1)
             for g in optimizer_D.param_groups:
                 g['lr'] = max(min_lr, g['lr'] / 1.1)
-            n_critic_current = min(n_critic_current + 1, 10)  # limiter n_critic max 10
-            g_steps_current = min(g_steps_current + 1, 5)     # limiter g_steps max 5
-            print(f"⚠️ FID a augmenté par rapport à l'epoch précédent. Ajustement dynamique appliqué.")
+            n_critic_current = min(n_critic_current + 1, 10)
+            g_steps_current = min(g_steps_current + 1, 5)
+            print(f"⚠️ Ajustement dynamique appliqué : FID, IS ou fake_correct a déclenché")
 
         prev_fid = fid_value
+        IS_prev = IS_value
 
         # ---- Affichage console métriques et params
         print(f"[{phase.upper()}] lossD={loss_D_epoch:.4f}, lossG={loss_G_epoch:.4f}, "
@@ -251,11 +255,11 @@ for epoch in range(start_epoch, start_epoch + CONFIG["num_extra_epochs"]):
 
     # ---- Save models & samples tous les 5 epochs
     if (epoch+1) % 5 == 0:
-        torch.save(G.state_dict(), os.path.join(MODEL_DIR, f"G_epoch_{epoch+1}.pth"))
-        torch.save(D.state_dict(), os.path.join(MODEL_DIR, f"D_epoch_{epoch+1}.pth"))
+        torch.save(G.state_dict(), os.path.join(MODEL_DIR, f"G_epoch_{epoch+1}_v3.pth"))
+        torch.save(D.state_dict(), os.path.join(MODEL_DIR, f"D_epoch_{epoch+1}_v3.pth"))
         z = torch.randn(16, CONFIG["latent_dim"],1,1, device=device)
         with torch.no_grad(): fake_grid = (ema_G(z).clamp(-1,1)+1)/2
-        save_image(fake_grid, os.path.join(MODEL_DIR, f"samples_epoch_{epoch+1}.png"), nrow=4, normalize=True)
+        save_image(fake_grid, os.path.join(MODEL_DIR, f"samples_epoch_{epoch+1}_v3.png"), nrow=4, normalize=True)
         print(f"💾 Saved models and sample grid at epoch {epoch+1}")
 
 print(f"✅ Fine-tuning dynamique terminé en {time.time()-start_time:.1f}s")
